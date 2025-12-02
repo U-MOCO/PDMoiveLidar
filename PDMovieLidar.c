@@ -66,11 +66,13 @@ int target_position = 0; // 目标位置
 int operation_mode = 8; // 0=待机 8=位置控制模式 9=速度控制模式
 
 unsigned char modbus_remote_control_on[] = {0x00, 0x00, 0x00, 0x02, 0x04, 0x01, 0x00, 0x01, 0x00};//远程控制启动
-unsigned char modbus_auto_focus_mode_close[] = {0x00, 0x00, 0x00, 0x02, 0x04, 0x0A, 0x00, 0x0, 0x00};//自动对焦模式关闭
-unsigned char modbus_range_learning_control[] = {0x00, 0x00, 0x00, 0x02, 0x04, 0xFF, 0xFF, 0x01, 0x00};//行程学习
+unsigned char modbus_auto_focus_mode_close[] = {0x00, 0x00, 0x00, 0x02, 0x04, 0x0C, 0x00, 0x00, 0x00};//纯手动无线对焦模式
+unsigned char modbus_auto_focus_mode_hyprid[] = {0x00, 0x00, 0x00, 0x02, 0x04, 0x0C, 0x00, 0x01, 0x00};//双Lidar自动对焦模式（Hybrid mode）
+unsigned char modbus_auto_focus_mode_energy[] = {0x00, 0x00, 0x00, 0x02, 0x04, 0x0C, 0x00, 0x02, 0x00};//单Lidar自动对焦模式（Energy mode）
+
+unsigned char modbus_range_learning_control[] = {0x00, 0x00, 0x00, 0x02, 0x04, 0xFF, 0xFF, 0x01, 0x00};//行程学习c
 unsigned char modbus_operation_mode_csp[] = {0x00, 0x02, 0x00, 0x02, 0x04, 0x08, 0x00, 0x0F, 0x00};//位置控制模式
 unsigned char modbus_target_position[] = {0x00, 0x04, 0x00, 0x02, 0x04, 0x00, 0x00, 0x00, 0x00,};//设置目标位置
-
 // 打开串口
 int open_serial(const char *device)
 {
@@ -240,6 +242,7 @@ int test_setters(int serial_fd)
     send_modbus_data(serial_fd, NODE_ID, WRITE_L, modbus_remote_control_on, sizeof(modbus_remote_control_on));
     usleep(500000); // 等待100ms
 
+
     send_modbus_data(serial_fd, NODE_ID, WRITE_L, modbus_range_learning_control, sizeof(modbus_range_learning_control));
     for(int j=0; j<10; j++){
         sleep(1); // 等待1秒
@@ -249,35 +252,105 @@ int test_setters(int serial_fd)
     send_modbus_data(serial_fd, NODE_ID, WRITE_L, modbus_operation_mode_csp, sizeof(modbus_operation_mode_csp));
     usleep(500000); // 等待500ms
 
-    while(1){
-        target_position = (i % 2) ? 0xFFFF : 0; // 交替设置目标位置
-        set_target_position(serial_fd, target_position);
-        usleep(100000); // 等待100ms
-        i++;
-        for(int j=0; j<9; j++){
-        if (send_modbus_data(serial_fd, NODE_ID, WRITE_L, modbus_position_actual_value, sizeof(modbus_position_actual_value)) < 0)
-        {
-            close_serial(serial_fd);
-            return 1;
-        }
-        usleep(100000); // 等待100ms
+    // while(1){
+    //     target_position = (i % 2) ? 0xFFFF : 0; // 交替设置目标位置
+    //     set_target_position(serial_fd, target_position);
+    //     usleep(100000); // 等待100ms
+    //     i++;
+    //     for(int j=0; j<9; j++){
+    //     if (send_modbus_data(serial_fd, NODE_ID, WRITE_L, modbus_position_actual_value, sizeof(modbus_position_actual_value)) < 0)
+    //     {
+    //         close_serial(serial_fd);
+    //         return 1;
+    //     }
+    //     usleep(100000); // 等待100ms
         
-        // 接收数据
-        int bytes_received = read(serial_fd, recv_buffer, BUFFER_SIZE);
-        if (bytes_received > 0)
-        {
-            print_hex("RX: ", recv_buffer, bytes_received);
-            // printf("Received %d bytes\n", bytes_received);
-        }
-        }
+    //     // 接收数据
+    //     int bytes_received = read(serial_fd, recv_buffer, BUFFER_SIZE);
+    //     if (bytes_received > 0)
+    //     {
+    //         print_hex("RX: ", recv_buffer, bytes_received);
+    //         // printf("Received %d bytes\n", bytes_received);
+    //     }
+    //     }
 
+    // }
+
+}
+
+// 十六进制字符串转字节数组函数
+int hex_string_to_bytes(const char* hex_str, unsigned char* bytes, int max_len)
+{
+    int len = 0;
+    char temp[3] = {0};
+    
+    while (*hex_str && len < max_len) {
+        // 跳过空格
+        if (*hex_str == ' ') {
+            hex_str++;
+            continue;
+        }
+        
+        // 提取两个十六进制字符
+        if (hex_str[0] && hex_str[1]) {
+            temp[0] = hex_str[0];
+            temp[1] = hex_str[1];
+            bytes[len++] = (unsigned char)strtol(temp, NULL, 16);
+            hex_str += 2;
+        } else {
+            break;
+        }
     }
+    
+    return len;
+}
 
+void interactive_modbus(int serial_fd)
+{
+    char input[256];
+    unsigned char send_data[128];
+    unsigned char recv_buffer[BUFFER_SIZE];
+    int len;
+    
+    printf("Enter Modbus hex codes (e.g. 01 06 00 00 00 0A):\n");
+    
+    while(1) {
+        printf("Modbus> ");
+        fflush(stdout);
+        
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            break;
+        }
+        
+        // 去除换行符
+        input[strcspn(input, "\n")] = 0;
+        
+        if (strcmp(input, "quit") == 0) {
+            break;
+        }
+        
+        // 将输入的十六进制字符串转换为字节数据
+        len = hex_string_to_bytes(input, send_data, sizeof(send_data));
+        if (len > 0) {
+            // 发送Modbus数据
+            write(serial_fd, send_data, len);
+            
+            // 接收并显示响应
+            usleep(100000);
+            int bytes_received = read(serial_fd, recv_buffer, BUFFER_SIZE);
+            if (bytes_received > 0) {
+                print_hex("Response: ", recv_buffer, bytes_received);
+            }
+        } else {
+            printf("Invalid hex format\n");
+        }
+    }
 }
 
 int main()
 {
     int serial_fd;
+    char input_line[256];
 
     // 打开串口
     serial_fd = open_serial(SERIAL_PORT);
@@ -291,12 +364,136 @@ int main()
         return 1;
     }
 
-    printf("Version: %s, Info: %s\n", VERSION, INFO_STRING);
+    printf("Modbus CRC计算器 - 输入十六进制数据，自动计算CRC并发送\n");
+    printf("格式示例: 01 04 00 00 00 02\n");
+    printf("输入 'quit' 退出\n");
+    
+    // 设置终端为行缓冲模式，立即响应输入
+    struct termios old_term, new_term;
+    tcgetattr(STDIN_FILENO, &old_term);
+    new_term = old_term;
+    new_term.c_lflag &= ~ICANON;  // 禁用规范模式
+    new_term.c_lflag |= ECHO;     // 启用回显
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
 
     test_setters(serial_fd);
+    
+    while (1)
+    {
+        printf("\n请输入Modbus数据: ");
+        fflush(stdout);
+        
+        // 使用fgets获取整行输入
+        if (fgets(input_line, sizeof(input_line), stdin) == NULL)
+        {
+            break;
+        }
+        
+        // 去除换行符
+        input_line[strcspn(input_line, "\n")] = 0;
+        
+        // 检查是否退出
+        if (strcmp(input_line, "quit") == 0 || strcmp(input_line, "exit") == 0)
+        {
+            break;
+        }
+        
+        // 如果输入为空，跳过
+        if (strlen(input_line) == 0)
+        {
+            continue;
+        }
+        
+        // 解析十六进制数据
+        unsigned char modbus_data[256];
+        int data_count = 0;
+        char *token = strtok(input_line, " ");
+        
+        while (token != NULL && data_count < 256)
+        {
+            // 支持0x前缀和纯十六进制
+            modbus_data[data_count] = (unsigned char)strtol(token, NULL, 16);
+            data_count++;
+            token = strtok(NULL, " ");
+        }
+        
+        if (data_count == 0)
+        {
+            printf("错误: 没有有效的十六进制数据\n");
+            continue;
+        }
+        
+        // 计算CRC
+        unsigned short crc = modbus_crc16(modbus_data, data_count);
+        
+        // 打印结果
+        printf("CRC计算完成: 0x%04X\n", crc);
+        printf("完整帧: ");
+        for (int i = 0; i < data_count; i++)
+        {
+            printf("%02X ", modbus_data[i]);
+        }
+        printf("%02X %02X\n", crc & 0xFF, (crc >> 8) & 0xFF);
+        
+        // 发送到串口（如果需要）
+        if (serial_fd > 0)
+        {
+            unsigned char send_buf[258];
+            memcpy(send_buf, modbus_data, data_count);
+            send_buf[data_count] = crc & 0xFF;      // CRC低字节
+            send_buf[data_count + 1] = (crc >> 8) & 0xFF; // CRC高字节
+            
+            // 发送
+            int bytes_written = write(serial_fd, send_buf, data_count + 2);
+            if (bytes_written > 0)
+            {
 
+            }
+            else
+            {
+                perror("发送失败");
+            }
+        }
+        
+        // 立即接收并显示响应（非阻塞方式）
+        if (serial_fd > 0)
+        {
+            unsigned char recv_buf[BUFFER_SIZE];
+            int bytes_read;
+            
+            // 尝试读取串口数据，最多等待100ms
+            fd_set readfds;
+            struct timeval tv;
+            
+            FD_ZERO(&readfds);
+            FD_SET(serial_fd, &readfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000;  // 100ms
+            
+            if (select(serial_fd + 1, &readfds, NULL, NULL, &tv) > 0)
+            {
+                bytes_read = read(serial_fd, recv_buf, BUFFER_SIZE);
+                if (bytes_read > 0)
+                {
+                    printf("接收到响应 (%d 字节): ", bytes_read);
+                    for (int i = 0; i < bytes_read; i++)
+                    {
+                        printf("%02X ", recv_buf[i]);
+                    }
+                    printf("\n");
+                }
+            }
+        }
+    }
+    
+    // 恢复终端设置
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+    
     // 关闭串口
-    close_serial(serial_fd);
-
+    if (serial_fd > 0)
+    {
+        close(serial_fd);
+    }
+    
     return 0;
 }
