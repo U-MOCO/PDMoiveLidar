@@ -2,7 +2,19 @@
 
 ## 常用命令
 
-```bush
+### 使用 Makefile 编译（推荐）
+```bash
+make clean
+make
+```
+
+### 直接使用交叉编译器编译
+```bash
+arm-none-linux-gnueabihf-gcc -g PDMovieLidar.c cJSON.c -o PDMovieLidar -pthread -I . -lm
+```
+
+### 原始测试程序编译
+```bash
 arm-none-linux-gnueabihf-gcc -g UartTest.c -o test -pthread -I . -lm
 ```
 

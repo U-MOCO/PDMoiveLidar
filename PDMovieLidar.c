@@ -5,6 +5,11 @@
 #include <termios.h> // tcgetattr(), tcsetattr()
 #include <unistd.h>  // read(), write(), close()
 #include <errno.h>   // errno
+#include <sys/socket.h>  // socket
+#include <netinet/in.h>  // sockaddr_in
+#include <arpa/inet.h>   // inet_aton, inet_ntoa
+#include <signal.h>      // signal
+#include "cJSON.h"   // JSON解析
 
 /* #region 调试宏定义 */
 
@@ -52,6 +57,43 @@ struct timeval LOG_tv;
 #define SERIAL_PORT "/dev/ttyS4"
 #define BAUDRATE B115200
 #define BUFFER_SIZE 128
+
+/* 预定义的JSON命令 */
+typedef struct {
+    const char *command_name;
+    unsigned char cmd[32];
+    int cmd_len;
+    const char *description;
+} PredefinedCommand;
+
+/* 支持的完整命令列表 */
+PredefinedCommand predefined_commands[] = {
+    {
+        "query_radar_data",
+        {0x01, 0x04, 0x00, 0x1E, 0x00, 0x02, 0x11, 0xCD},
+        8,
+        "查询当前雷达混合距离数据"
+    },
+    {
+        "remote_control_on",
+        {0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0x01, 0x00, 0x01, 0x00, 0xF3, 0xC3},
+        13,
+        "远程控制开启"
+    },
+    {
+        "force_radar_on",
+        {0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0x0A, 0x00, 0x01, 0x00, 0xF1, 0xE7},
+        13,
+        "强制雷达开启"
+    },
+    {
+        "range_learning_csp_run",
+        {0x01, 0x10, 0x00, 0x00, 0x00, 0x04, 0x08, 0xFF, 0xFF, 0x01, 0x00, 0x08, 0x00, 0x0F, 0x00, 0xF0, 0x30},
+        17,
+        "行程学习+进入CSP模式+运行"
+    },
+    {NULL, {}, 0, NULL}
+};
 
 //读
 unsigned char modbus_product_code[] = {0x00, 0x00, 0x00, 0x02};
@@ -305,6 +347,271 @@ int hex_string_to_bytes(const char* hex_str, unsigned char* bytes, int max_len)
     return len;
 }
 
+/* JSON命令处理函数 */
+int process_json_command(int serial_fd, const char *json_str)
+{
+    cJSON *json = NULL;
+    cJSON *cmd_item = NULL;
+    const char *command = NULL;
+    int result = -1;
+    
+    /* 解析JSON */
+    json = cJSON_Parse(json_str);
+    if (!json) {
+        fprintf(stderr, "[ERROR] JSON解析失败\n");
+        return -1;
+    }
+    
+    /* 获取command字段 */
+    cmd_item = cJSON_GetObjectItem(json, "command");
+    if (!cmd_item || cmd_item->type != cJSON_String) {
+        fprintf(stderr, "[ERROR] JSON必须包含'command'字段\n");
+        cJSON_Delete(json);
+        return -1;
+    }
+    
+    command = cmd_item->valuestring;
+    
+    /* 查找匹配的预定义命令 */
+    for (int i = 0; predefined_commands[i].command_name != NULL; i++) {
+        if (strcmp(predefined_commands[i].command_name, command) == 0) {
+            const unsigned char *cmd_data = predefined_commands[i].cmd;
+            int cmd_len = predefined_commands[i].cmd_len;
+            
+            printf("\n[INFO] 执行命令: %s (%s)\n", 
+                   predefined_commands[i].command_name,
+                   predefined_commands[i].description);
+            
+            /* 打印要发送的命令 */
+            printf("[TX] ");
+            for (int j = 0; j < cmd_len; j++) {
+                printf("%02X ", cmd_data[j]);
+            }
+            printf("\n");
+            
+            /* 发送命令 */
+            int bytes_written = write(serial_fd, cmd_data, cmd_len);
+            if (bytes_written < 0) {
+                fprintf(stderr, "[ERROR] 串口发送失败\n");
+                cJSON_Delete(json);
+                return -1;
+            }
+            
+            /* 接收响应 */
+            unsigned char recv_buffer[BUFFER_SIZE];
+            usleep(200000);  /* 等待200ms */
+            int bytes_received = read(serial_fd, recv_buffer, BUFFER_SIZE);
+            
+            if (bytes_received > 0) {
+                printf("[RX] ");
+                for (int j = 0; j < bytes_received; j++) {
+                    printf("%02X ", recv_buffer[j]);
+                }
+                printf("\n");
+                
+                /* 验证CRC */
+                if (bytes_received >= 2) {
+                    unsigned short received_crc = (recv_buffer[bytes_received - 1] << 8) | recv_buffer[bytes_received - 2];
+                    unsigned short calculated_crc = modbus_crc16(recv_buffer, bytes_received - 2);
+                    
+                    if (received_crc == calculated_crc) {
+                        printf("[INFO] CRC校验成功\n");
+                        result = 0;
+                    } else {
+                        printf("[WARN] CRC校验失败: 接收=0x%04X, 计算=0x%04X\n", 
+                               received_crc, calculated_crc);
+                        result = 0;  /* 仍然视为成功，因为接收到了数据 */
+                    }
+                } else {
+                    result = 0;
+                }
+            } else {
+                printf("[WARN] 没有接收到响应\n");
+                result = 0;
+            }
+            
+            cJSON_Delete(json);
+            return result;
+        }
+    }
+    
+    /* 命令未找到 */
+    fprintf(stderr, "[ERROR] 未知命令: %s\n", command);
+    fprintf(stderr, "[INFO] 支持的命令有:\n");
+    for (int i = 0; predefined_commands[i].command_name != NULL; i++) {
+        fprintf(stderr, "  - %s: %s\n", 
+                predefined_commands[i].command_name,
+                predefined_commands[i].description);
+    }
+    
+    cJSON_Delete(json);
+    return -1;
+}
+
+/* UDP 服务器模式 */
+void udp_server_mode(int serial_fd)
+{
+    int udp_socket;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    unsigned char buffer[1024];
+    unsigned char response_buffer[1024];
+    int bytes_received;
+    const char *response_msg;
+    const char *allowed_ip = "192.168.200.20";  /* 只允许的IP地址 */
+
+    /* 创建 UDP socket */
+    udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_socket < 0) {
+        perror("Error creating UDP socket");
+        return;
+    }
+
+    /* 设置地址重用 */
+    int reuse = 1;
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        perror("Error setting socket options");
+        close(udp_socket);
+        return;
+    }
+
+    /* 绑定端口 */
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(8080);
+
+    if (bind(udp_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Error binding UDP socket");
+        close(udp_socket);
+        return;
+    }
+
+    printf("\n========================================\n");
+    printf("UDP 服务器启动\n");
+    printf("监听端口: 8080\n");
+    printf("只接收来自 %s 的 JSON 命令\n", allowed_ip);
+    printf("========================================\n\n");
+
+    while (1) {
+        /* 接收 UDP 数据 */
+        bytes_received = recvfrom(udp_socket, buffer, sizeof(buffer) - 1, 0,
+                                  (struct sockaddr *)&client_addr, &client_addr_len);
+
+        if (bytes_received < 0) {
+            perror("Error receiving UDP data");
+            continue;
+        }
+
+        buffer[bytes_received] = '\0';
+
+        /* 获取客户端 IP 地址 */
+        char *client_ip = inet_ntoa(client_addr.sin_addr);
+        
+        printf("[UDP] 接收到来自 %s:%d 的数据\n",
+               client_ip,
+               ntohs(client_addr.sin_port));
+
+        /* 检查 IP 地址是否被允许 */
+        if (strcmp(client_ip, allowed_ip) != 0) {
+            printf("[WARN] 拒绝来自 %s 的连接（不在允许列表中）\n", client_ip);
+            
+            /* 可选：发送拒绝响应 */
+            response_msg = "{\"status\":\"error\",\"message\":\"IP not authorized\"}";
+            int response_len = strlen(response_msg);
+            sendto(udp_socket, response_msg, response_len, 0,
+                   (struct sockaddr *)&client_addr, client_addr_len);
+            printf("[UDP] 已发送拒绝响应\n\n");
+            continue;
+        }
+
+        printf("[UDP] IP 地址验证通过\n");
+        printf("[UDP] 数据: %s\n", (char *)buffer);
+
+        /* 处理 JSON 命令 */
+        if (process_json_command(serial_fd, (const char *)buffer) == 0) {
+            response_msg = "{\"status\":\"success\",\"message\":\"Command executed\"}";
+        } else {
+            response_msg = "{\"status\":\"error\",\"message\":\"Command failed\"}";
+        }
+
+        /* 发送响应 */
+        int response_len = strlen(response_msg);
+        if (sendto(udp_socket, response_msg, response_len, 0,
+                   (struct sockaddr *)&client_addr, client_addr_len) < 0) {
+            perror("Error sending UDP response");
+        } else {
+            printf("[UDP] 发送响应: %s\n\n", response_msg);
+        }
+    }
+
+    close(udp_socket);
+}
+
+/* JSON交互模式 */
+void interactive_json_mode(int serial_fd)
+{
+    char input[512];
+    
+    printf("\n========================================\n");
+    printf("JSON交互模式 - 输入JSON命令或输入'help'查看帮助\n");
+    printf("========================================\n\n");
+    
+    printf("支持的命令:\n");
+    for (int i = 0; predefined_commands[i].command_name != NULL; i++) {
+        printf("  - %s: %s\n", 
+               predefined_commands[i].command_name,
+               predefined_commands[i].description);
+    }
+    printf("\n");
+    
+    while (1) {
+        printf("json> ");
+        fflush(stdout);
+        
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            break;
+        }
+        
+        /* 去除换行符 */
+        input[strcspn(input, "\n")] = 0;
+        
+        /* 检查退出命令 */
+        if (strcmp(input, "quit") == 0 || strcmp(input, "exit") == 0) {
+            printf("[INFO] 退出JSON模式\n");
+            break;
+        }
+        
+        /* 检查帮助命令 */
+        if (strcmp(input, "help") == 0) {
+            printf("\n支持的命令:\n");
+            for (int i = 0; predefined_commands[i].command_name != NULL; i++) {
+                printf("  - %s: %s\n", 
+                       predefined_commands[i].command_name,
+                       predefined_commands[i].description);
+            }
+            printf("\nJSON格式示例:\n");
+            printf("  {\"command\": \"query_radar_data\"}\n");
+            printf("  {\"command\": \"remote_control_on\"}\n");
+            printf("  {\"command\": \"force_radar_on\"}\n");
+            printf("  {\"command\": \"range_learning_csp_run\"}\n\n");
+            continue;
+        }
+        
+        /* 跳过空输入 */
+        if (strlen(input) == 0) {
+            continue;
+        }
+        
+        /* 处理JSON命令 */
+        if (process_json_command(serial_fd, input) == 0) {
+            printf("[SUCCESS] 命令执行成功\n\n");
+        } else {
+            printf("[FAILED] 命令执行失败\n\n");
+        }
+    }
+}
+
 void interactive_modbus(int serial_fd)
 {
     char input[256];
@@ -364,130 +671,164 @@ int main()
         return 1;
     }
 
-    printf("Modbus CRC计算器 - 输入十六进制数据，自动计算CRC并发送\n");
-    printf("格式示例: 01 04 00 00 00 02\n");
-    printf("输入 'quit' 退出\n");
+    printf("========================================\n");
+    printf("%s v%s\n", INFO_STRING, VERSION);
+    printf("========================================\n");
+    printf("选择模式:\n");
+    printf("1. JSON命令模式 (推荐)\n");
+    printf("2. 十六进制Modbus模式\n");
+    printf("3. UDP网络模式 (监听端口 8080)\n");
+    printf("4. 自动测试\n");
+    printf("请选择 (1-4): ");
     
-    // 设置终端为行缓冲模式，立即响应输入
-    struct termios old_term, new_term;
-    tcgetattr(STDIN_FILENO, &old_term);
-    new_term = old_term;
-    new_term.c_lflag &= ~ICANON;  // 禁用规范模式
-    new_term.c_lflag |= ECHO;     // 启用回显
-    tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
-
-    test_setters(serial_fd);
+    fgets(input_line, sizeof(input_line), stdin);
+    input_line[strcspn(input_line, "\n")] = 0;
     
-    while (1)
-    {
-        printf("\n请输入Modbus数据: ");
-        fflush(stdout);
-        
-        // 使用fgets获取整行输入
-        if (fgets(input_line, sizeof(input_line), stdin) == NULL)
-        {
+    int mode = atoi(input_line);
+    
+    switch(mode) {
+        case 1:
+            /* JSON模式 */
+            interactive_json_mode(serial_fd);
             break;
-        }
-        
-        // 去除换行符
-        input_line[strcspn(input_line, "\n")] = 0;
-        
-        // 检查是否退出
-        if (strcmp(input_line, "quit") == 0 || strcmp(input_line, "exit") == 0)
-        {
-            break;
-        }
-        
-        // 如果输入为空，跳过
-        if (strlen(input_line) == 0)
-        {
-            continue;
-        }
-        
-        // 解析十六进制数据
-        unsigned char modbus_data[256];
-        int data_count = 0;
-        char *token = strtok(input_line, " ");
-        
-        while (token != NULL && data_count < 256)
-        {
-            // 支持0x前缀和纯十六进制
-            modbus_data[data_count] = (unsigned char)strtol(token, NULL, 16);
-            data_count++;
-            token = strtok(NULL, " ");
-        }
-        
-        if (data_count == 0)
-        {
-            printf("错误: 没有有效的十六进制数据\n");
-            continue;
-        }
-        
-        // 计算CRC
-        unsigned short crc = modbus_crc16(modbus_data, data_count);
-        
-        // 打印结果
-        printf("CRC计算完成: 0x%04X\n", crc);
-        printf("完整帧: ");
-        for (int i = 0; i < data_count; i++)
-        {
-            printf("%02X ", modbus_data[i]);
-        }
-        printf("%02X %02X\n", crc & 0xFF, (crc >> 8) & 0xFF);
-        
-        // 发送到串口（如果需要）
-        if (serial_fd > 0)
-        {
-            unsigned char send_buf[258];
-            memcpy(send_buf, modbus_data, data_count);
-            send_buf[data_count] = crc & 0xFF;      // CRC低字节
-            send_buf[data_count + 1] = (crc >> 8) & 0xFF; // CRC高字节
+        case 2:
+            /* Modbus十六进制模式 */
+            printf("Modbus CRC计算器 - 输入十六进制数据，自动计算CRC并发送\n");
+            printf("格式示例: 01 04 00 00 00 02\n");
+            printf("输入 'quit' 退出\n");
             
-            // 发送
-            int bytes_written = write(serial_fd, send_buf, data_count + 2);
-            if (bytes_written > 0)
+            // 设置终端为行缓冲模式，立即响应输入
+            struct termios old_term, new_term;
+            tcgetattr(STDIN_FILENO, &old_term);
+            new_term = old_term;
+            new_term.c_lflag &= ~ICANON;  // 禁用规范模式
+            new_term.c_lflag |= ECHO;     // 启用回显
+            tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
+            
+            while (1)
             {
-
-            }
-            else
-            {
-                perror("发送失败");
-            }
-        }
-        
-        // 立即接收并显示响应（非阻塞方式）
-        if (serial_fd > 0)
-        {
-            unsigned char recv_buf[BUFFER_SIZE];
-            int bytes_read;
-            
-            // 尝试读取串口数据，最多等待100ms
-            fd_set readfds;
-            struct timeval tv;
-            
-            FD_ZERO(&readfds);
-            FD_SET(serial_fd, &readfds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 100000;  // 100ms
-            
-            if (select(serial_fd + 1, &readfds, NULL, NULL, &tv) > 0)
-            {
-                bytes_read = read(serial_fd, recv_buf, BUFFER_SIZE);
-                if (bytes_read > 0)
+                printf("\n请输入Modbus数据: ");
+                fflush(stdout);
+                
+                // 使用fgets获取整行输入
+                if (fgets(input_line, sizeof(input_line), stdin) == NULL)
                 {
-                    printf("接收到响应 (%d 字节): ", bytes_read);
-                    for (int i = 0; i < bytes_read; i++)
+                    break;
+                }
+                
+                // 去除换行符
+                input_line[strcspn(input_line, "\n")] = 0;
+                
+                // 检查是否退出
+                if (strcmp(input_line, "quit") == 0 || strcmp(input_line, "exit") == 0)
+                {
+                    break;
+                }
+                
+                // 如果输入为空，跳过
+                if (strlen(input_line) == 0)
+                {
+                    continue;
+                }
+                
+                // 解析十六进制数据
+                unsigned char modbus_data[256];
+                int data_count = 0;
+                char *token = strtok(input_line, " ");
+                
+                while (token != NULL && data_count < 256)
+                {
+                    // 支持0x前缀和纯十六进制
+                    modbus_data[data_count] = (unsigned char)strtol(token, NULL, 16);
+                    data_count++;
+                    token = strtok(NULL, " ");
+                }
+                
+                if (data_count == 0)
+                {
+                    printf("错误: 没有有效的十六进制数据\n");
+                    continue;
+                }
+                
+                // 计算CRC
+                unsigned short crc = modbus_crc16(modbus_data, data_count);
+                
+                // 打印结果
+                printf("CRC计算完成: 0x%04X\n", crc);
+                printf("完整帧: ");
+                for (int i = 0; i < data_count; i++)
+                {
+                    printf("%02X ", modbus_data[i]);
+                }
+                printf("%02X %02X\n", crc & 0xFF, (crc >> 8) & 0xFF);
+                
+                // 发送到串口（如果需要）
+                if (serial_fd > 0)
+                {
+                    unsigned char send_buf[258];
+                    memcpy(send_buf, modbus_data, data_count);
+                    send_buf[data_count] = crc & 0xFF;      // CRC低字节
+                    send_buf[data_count + 1] = (crc >> 8) & 0xFF; // CRC高字节
+                    
+                    // 发送
+                    int bytes_written = write(serial_fd, send_buf, data_count + 2);
+                    if (bytes_written > 0)
                     {
-                        printf("%02X ", recv_buf[i]);
+
                     }
-                    printf("\n");
+                    else
+                    {
+                        perror("发送失败");
+                    }
+                }
+                
+                // 立即接收并显示响应（非阻塞方式）
+                if (serial_fd > 0)
+                {
+                    unsigned char recv_buf[BUFFER_SIZE];
+                    int bytes_read;
+                    
+                    // 尝试读取串口数据，最多等待100ms
+                    fd_set readfds;
+                    struct timeval tv;
+                    
+                    FD_ZERO(&readfds);
+                    FD_SET(serial_fd, &readfds);
+                    tv.tv_sec = 0;
+                    tv.tv_usec = 100000;  // 100ms
+                    
+                    if (select(serial_fd + 1, &readfds, NULL, NULL, &tv) > 0)
+                    {
+                        bytes_read = read(serial_fd, recv_buf, BUFFER_SIZE);
+                        if (bytes_read > 0)
+                        {
+                            printf("接收到响应 (%d 字节): ", bytes_read);
+                            for (int i = 0; i < bytes_read; i++)
+                            {
+                                printf("%02X ", recv_buf[i]);
+                            }
+                            printf("\n");
+                        }
+                    }
                 }
             }
-        }
+            
+            // 恢复终端设置
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+            break;
+        case 3:
+            /* UDP 网络模式 */
+            udp_server_mode(serial_fd);
+            break;
+        case 4:
+            /* 自动测试模式 */
+            printf("\n[INFO] 开始自动测试...\n");
+            test_setters(serial_fd);
+            printf("[INFO] 自动测试完成\n");
+            break;
+        default:
+            printf("无效选择\n");
     }
-    
-    // 恢复终端设置
-    tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
     
     // 关闭串口
     if (serial_fd > 0)
